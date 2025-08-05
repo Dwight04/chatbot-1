@@ -32,14 +32,50 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Create a chat input field
-    if prompt := st.chat_input("Get me first 10 rows"):
-        # Store and display the current prompt
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+import re
 
-        # Generate SQL query
+def parse_query(prompt):
+    """Parse user query and return query type and parameters"""
+    prompt_lower = prompt.lower()
+    
+    # Check for row queries like "give me 10 rows"
+    row_match = re.search(r'(\d+)\s*rows?', prompt_lower)
+    if row_match:
+        return {'type': 'rows', 'n_rows': int(row_match.group(1))}
+    
+    # Check for sum queries like "sum of sales by region"
+    sum_match = re.search(r'sum\s+(?:of\s+)?(\w+)\s+by\s+(\w+)', prompt_lower)
+    if sum_match:
+        return {'type': 'sum', 'column': sum_match.group(1), 'group_by': sum_match.group(2)}
+    
+    return {'type': 'unknown'}
+
+# Create a chat input field
+if prompt := st.chat_input("Enter your query (e.g., 'Give me 10 rows' or 'Sum of sales by region')"):
+    # Store and display the current prompt
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Parse the query
+    query_info = parse_query(prompt)
+    
+    if query_info['type'] == 'rows':
+        # Generate SQL directly for row requests
+        QUERY = f"SELECT * FROM {bigquery_table_name} LIMIT {query_info['n_rows']}"
+        
+    elif query_info['type'] == 'aggregation':
+        # Generate SQL directly for aggregation requests
+        operation = query_info['operation'].upper()
+        if operation in ['AVERAGE', 'AVG', 'MEAN']:
+            operation = 'AVG'
+        elif operation == 'TOTAL':
+            operation = 'SUM'
+        
+        QUERY = f"SELECT {query_info['group_by']}, {operation}({query_info['column']}) as {operation.lower()}_{query_info['column']} FROM {bigquery_table_name} GROUP BY {query_info['group_by']}"
+        
+    else:
+        # Use GPT for complex queries
         stream = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -54,21 +90,21 @@ else:
 
         # Clean SQL query
         QUERY = response.replace("```sql", "").replace("```", "").strip()
-        
-        # Show what we're running
-        st.code(QUERY)
-        
+    
+    # Show what we're running
+    st.code(QUERY)
+    
+    try:
+        # Run BigQuery
+        bigquery_client = bigquery.Client.from_service_account_info(dict(st.secrets["gcp_service_account"]))
+        data = bigquery_client.query(QUERY).to_dataframe()
+        st.dataframe(data)
+    except Exception as e:
+        st.error(f"Error: {e}")
+        # Try simple fallback
         try:
-            # Run BigQuery
-            bigquery_client = bigquery.Client.from_service_account_info(dict(st.secrets["gcp_service_account"]))
-            data = bigquery_client.query(QUERY).to_dataframe()
+            fallback = f"SELECT * FROM {bigquery_table_name} LIMIT 10"
+            data = bigquery_client.query(fallback).to_dataframe()
             st.dataframe(data)
-        except Exception as e:
-            st.error(f"Error: {e}")
-            # Try simple fallback
-            try:
-                fallback = f"SELECT * FROM {bigquery_table_name} LIMIT 10"
-                data = bigquery_client.query(fallback).to_dataframe()
-                st.dataframe(data)
-            except Exception as fallback_error:
-                st.error(f"Fallback also failed: {fallback_error}")
+        except Exception as fallback_error:
+            st.error(f"Fallback also failed: {fallback_error}")    
